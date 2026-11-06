@@ -1,0 +1,15 @@
+Lab PySpark silver - réponses
+
+1. Parquet seul (silver/spark/orders.parquet/) :
+Le dossier contient un fichier part-*.parquet avec les données et un
+fichier _SUCCESS qui marque la fin de l'écriture. Aucun fichier ne décrit
+le schéma ou l'historique : le lecteur doit deviner la structure en lisant
+les fichiers.
+
+2. Iceberg (warehouse/silver/orders/) :
+- data/ : contient les fichiers Parquet (les données).
+- metadata/ : contient v1.metadata.json (schéma et historique), le
+  snapshot snap-*.avro, le manifeste *-m0.avro et version-hint.text.
+
+Conclusion : les fichiers Parquet contiennent les données, et les fichiers
+de metadata/ décrivent la table (schéma, snapshots, historique).
