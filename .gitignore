@@ -5,3 +5,8 @@ __pycache__/
 *.csv
 *.duckdb
 init.sql
+logs/
+lab_medallion/target/
+lab_medallion/dbt_packages/
+lab_medallion/logs/
+lab_medallion/*.duckdb
