@@ -1,0 +1,149 @@
+RDD lab: answers to the questions
+=================================
+
+1. Partitions
+-------------
+Q: What decides the number of partitions textFile() picks by default, for a file this size?
+
+A: The number of partitions is the larger of two values: the number of blocks in the file (file size divided by the block size, 128 MB by default) and minPartitions, which defaults to 2. Both files are under 1 MB, so the minimum applies. Measured: users.csv gives 2 partitions. Passing minPartitions=8 on orders.csv gives 8 partitions.
+
+Q: repartition() and coalesce() both change the partition count. Which one shuffles data?
+
+A: repartition() always shuffles: rows are redistributed across the new partitions, and it can increase or decrease the count. coalesce() only merges existing partitions, without a full shuffle, so it can only decrease the count.
+
+
+2. Lazy evaluation and lineage
+------------------------------
+Observed: first() triggered Stage 0. filter() and toDebugString() did not read the data. count() returned 2829, the number of orders without the header.
+
+Q: Call orders_data.count() a second time. Does the Spark UI show a new stage? Why?
+
+A: Yes. Nothing is kept in memory by default, so Spark rereads the file and reapplies the filter for each action. Each action recomputes the lineage.
+
+Q: At which point would .cache() change that answer?
+
+A: If orders_data (or a RDD derived from it) is cached before the first action, the first action fills the cache and later actions read memory instead of the file. The Spark UI then shows the stored partitions in the Storage tab, and the later jobs skip the read stage.
+
+
+3. The cost of no schema: the multiline address
+-----------------------------------------------
+Observed: users_lines.count() returned 101 (1 header line plus 50 users spread over 2 physical lines each). After filtering on the leading UUID, users_records.count() returned 50.
+
+Q: Why does spark.read.csv(multiLine=True) not have this problem, while sc.textFile() does?
+
+A: The CSV reader knows the format: a quoted field may contain a line break, so it groups physical lines into one logical record. textFile() only sees lines, so it cannot know that a line break is inside a field.
+
+Q: What has to be true of a file format for a line-oriented reader to be safe?
+
+A: No record may span several physical lines, and no value may contain a line break. orders.csv has this property: a split on "," per line is safe, and the check confirmed it (2830 lines including the header, each with exactly 4 commas, 0 exceptions).
+
+
+4. Manual parsing
+-----------------
+Observed: orders_rdd.take(3) returned three correctly typed dictionaries (quantity as int, product in lowercase).
+
+Q: What would happen to parse_order if one line had an extra comma inside product?
+
+A: The split would return six values, and the unpacking into five variables would raise ValueError: too many values to unpack (expected 5). Spark would abort the job at the first action that touches that line. Tested with a malformed line: the error appeared at take(1), not when the RDD was defined.
+
+Q: Where does the DataFrame API perform the equivalent check, and when?
+
+A: With spark.read.csv, the check happens at read time. The reader applies a parsing mode (PERMISSIVE, DROPMALFORMED or FAILFAST) and converts types according to the schema. The error or the null value is decided when the file is read, not when the computation runs.
+
+
+5. Key-value RDDs: reduceByKey vs groupByKey
+--------------------------------------------
+Observed: both methods returned the same totals (for example 12 for the first user, 253 for ce9e1a11...). The sum over all users is 8615.
+
+Q: What does groupByKey shuffle instead, and why is that more expensive?
+
+A: groupByKey does not combine values before the shuffle: every individual quantity is sent over the network, so the shuffle volume is proportional to the number of rows. reduceByKey combines values inside each partition first, so only one partial result per key and per partition is sent.
+
+Q: For which aggregations is groupByKey unavoidable?
+
+A: When the operation cannot be combined partially, such as a median, or when the full list of values per key is needed. A sum, a count or a maximum can be combined, so reduceByKey (or aggregateByKey) is enough.
+
+
+6. Manual deduplication
+-----------------------
+Observed: orders_rdd.count() and orders_dedup.count() both returned 2829, because the data has no duplicates. A test with two artificial versions of the same order returned only the most recent one (date 2020-06-01, quantity 9).
+
+Q: partitionBy() in the window function shuffles rows so that a given order_id lands on one partition. What plays that role here?
+
+A: reduceByKey does it. Spark shuffles the (order_id, order) pairs so that all records of the same key reach the same partition before applying most_recent. The shuffle is implicit, but the cost is the same as the window function.
+
+Q: Which version states the intent more directly?
+
+A: The window function (PARTITION BY order_id ORDER BY ordered_at DESC, then row_number() = 1) is easier to read for someone who knows SQL. The reduceByKey version is closer to the mechanism, and it shows that a duplicate is resolved by a merge rule.
+
+
+7. Joining orders and users
+---------------------------
+Observed: enriched.take(3) returned (user_id, (order, username)) elements, all with the username kayla51 for user f143262f-.... leftOuterJoin with a filter on a missing name returned 0 on the real data. The join returned 2829 rows with a fake order, the leftOuterJoin returned 1.
+
+Q: What would need to be true for Spark to skip the shuffle in join()?
+
+A: Both RDDs would need to be partitioned the same way, with the same partitioner and the same number of partitions (co-partitioning, for example after the same partitionBy()). Keys with the same value would then already be on the same partition, and the join could be local.
+
+Q: What changes if leftOuterJoin() replaces join() and a user_id has no matching user?
+
+A: join() drops the order. leftOuterJoin() keeps it, with None in place of the name. Tested with a fake order: join returns 2829, leftOuterJoin with the filter kv[1][1] is None returns 1.
+
+Q: What is the risk of calling collect() on enriched on a much larger dataset?
+
+A: collect() sends every element to the driver, whose memory is limited. On a large dataset it fails with an OutOfMemoryError. The result should be aggregated, or written to distributed storage.
+
+
+8. Exercises
+------------
+Exercise 1: aggregateByKey
+
+    def seq_op(acc, quantity):
+        count, total = acc
+        return (count + 1, total + quantity)
+
+    def comb_op(acc1, acc2):
+        return (acc1[0] + acc2[0], acc1[1] + acc2[1])
+
+    user_stats = (
+        orders_rdd
+        .map(lambda o: (o["user_id"], o["quantity"]))
+        .aggregateByKey((0, 0), seq_op, comb_op)
+    )
+    avg_quantity = user_stats.mapValues(lambda acc: acc[1] / acc[0])
+
+Result: the order counts sum to 2829, and the totals match reduceByKey.
+
+Exercise 2: commands without a user
+
+    orphans = (
+        orders_with_fake
+        .map(lambda o: (o["user_id"], o))
+        .leftOuterJoin(users_kv)
+        .filter(lambda kv: kv[1][1] is None)
+    )
+
+Result: 1 orphan, the fake order.
+
+Exercise 3: DataFrame version
+
+    orders_df = spark.createDataFrame(
+        orders_rdd.map(lambda o: (o["user_id"], o["quantity"])),
+        ["user_id", "quantity"],
+    )
+    user_quantity_df = orders_df.groupBy("user_id").sum("quantity")
+
+Result: the total over all users is 8615 in both versions, and 253 for ce9e1a11.... The DataFrame plan shows HashAggregate (partial), then Exchange (the shuffle), then HashAggregate (final): the same partial combination as reduceByKey, but optimised by Catalyst. The RDD plan shows the ShuffledRDD and PairwiseRDD steps, without global optimisation.
+
+Exercise 4: cache
+
+    import time
+
+    orders_nocache = orders_data.map(parse_order)
+
+    def timed(rdd):
+        start = time.perf_counter()
+        rdd.count()
+        return round(time.perf_counter() - start, 3)
+
+Result: with cache, first count 0.267 s, second count 0.056 s. Without cache, 0.101 s then 0.122 s. The cache pays off on reuse, and the first run is slower because it also writes to memory. On 2829 rows the difference is dominated by task startup, so the measure is only indicative.
