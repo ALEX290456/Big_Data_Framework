@@ -1,0 +1,22 @@
+- Vérification : silver/spark/orders.parquet contient 2829 lignes, comme le
+  premier snapshot Iceberg. Il n'a pas suivi l'append ni l'INSERT, alors que
+  la table Iceberg a maintenant 2833 lignes et 3 snapshots.
+
+== Exercices (table users) ==
+1-3. lab.silver.users existait déjà (créée par le lab précédent) : mon
+  createOrReplace() a ajouté un 2e snapshot overwrite. Après l'append de
+  3 lignes : 53 lignes. Time travel : 50 lignes au premier snapshot, 53 à
+  l'état actuel.
+4. ALTER TABLE ADD COLUMN country : seul un fichier de métadonnées est écrit
+  (v4), sans nouveau Parquet ni snapshot. L'INSERT crée ensuite v5 et un
+  4e snapshot. Résultat attendu : 54 lignes dont 1 avec country = 'US'.
+5. users et orders ont le même layout S3 (data/ et metadata/). users a 4
+  snapshots, 5 versions de métadonnées et 4 Parquet ; orders a 3 snapshots,
+  4 versions et 3 Parquet. Chaque opération sur les données ajoute un
+  Parquet, un manifeste et une liste de manifestes ; chaque opération, ALTER
+  TABLE compris, ajoute un vN.metadata.json.
+6. Parquet : format de fichier colonnaire qui stocke les données. Iceberg :
+  format de table au-dessus de Parquet, avec schéma, snapshots, manifestes,
+  time travel et commits atomiques. Catalogue Iceberg : associe un nom de
+  table à l'emplacement de sa métadonnée courante et permet à plusieurs
+  moteurs de partager les tables.
