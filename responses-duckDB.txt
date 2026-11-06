@@ -1,0 +1,91 @@
+DuckDB lab: answers to the questions
+====================================
+
+1. Persistent S3 secret
+-----------------------
+Q: What are the risks of the persistent secret stored in a file of the home directory, and why are they limited on Onyxia?
+
+A: The file ~/.duckdb/stored_secrets holds the secret configuration. Any other process running as the same user can read it, and an accidental commit to Git would expose access. On Onyxia the risks are limited because the credentials are temporary, the secret uses credential_chain (it reads the keys from the AWS profile instead of storing them), and the home directory belongs to one service and one user.
+
+Q: How would you restrict the S3 access of a Kubernetes Job?
+
+A: Give the Job a dedicated service account with minimal rights: read-only on bronze/, write only on analytics/, no access to other buckets. Pass the credentials through a Kubernetes Secret, never in the image or the code. Short-lived credentials also limit the damage if they leak.
+
+
+2. Metadata and types
+---------------------
+Q: Why does approx_unique return 40 for user_uuid and 3167 for uuid, when there are 50 users and 2829 distinct orders?
+
+A: SUMMARIZE uses an approximate algorithm (HyperLogLog), which trades exactness for speed and memory. A gap this large is unusual on small data. Check with an exact computation: SELECT count(DISTINCT user_uuid), count(DISTINCT uuid) FROM orders; The quality checks confirm 50 users and 2829 distinct orders, so use count(DISTINCT ...) for metrics.
+
+Q: What problem can occur with type inference on a large file whose first rows are not representative?
+
+A: DuckDB infers each column's type from a sample. If the first rows contain integers and a later value is text (for example "N/A"), the read fails or the column is mistyped. Solutions: increase sample_size, read every column as text (all_varchar) and convert explicitly, or declare the types with the columns option.
+
+
+3. Parquet compression
+----------------------
+Q: Why is the uuid column barely compressed?
+
+A: SNAPPY looks for repeated byte sequences. Each UUID is unique and random, so there is almost nothing to repeat. Measured: 113,189 bytes uncompressed, 102,191 compressed, a gain of about 10%.
+
+Q: Why is the compressed size of some columns larger than their uncompressed size?
+
+A: The metadata counts page headers and the dictionary of dictionary-encoded columns. For a short column such as product (6 distinct values), this fixed overhead is of the same order as the data, so the compressed size is larger (1,271 bytes against 1,266).
+
+
+4. Hive partitioning
+--------------------
+Q: Why is partitioning by uuid a bad idea?
+
+A: Each value would become a folder and a file, so 2,829 small objects. Each file costs HTTP requests on object storage, and reading thousands of small files is much slower than reading a few large ones. Partitioning only helps on a column with few values, such as product.
+
+Q: Which partition column would you choose for orders that accumulate every day?
+
+A: A time column, for example year / month or the date. New orders go into new folders, old files are not rewritten, and queries on a period only read the matching folders.
+
+Check: EXPLAIN ANALYZE with product = 'cookie' shows Scanning Files: 1/6 and 466 rows.
+
+
+5. CSV vs Parquet at scale
+--------------------------
+Measured data: orders_large.csv is 29,574,123 bytes on S3, orders.parquet is 11,532,863 bytes (ratio about 2.6). 252,416 rows, 3 row groups (123,573 + 124,276 + 4,567).
+
+Q: How many row groups does the file contain, and how many are skipped by the filter date >= '2100-01-01'?
+
+A: Three row groups, with stats_max values of 2034-02-04, 2048-04-10 and 2048-10-17. None can contain a date >= 2100, so all three are skipped. The filter query read only 16 KiB in a single GET: the footer.
+
+Q: The orders are sorted by date. What would happen if they were shuffled?
+
+A: Each row group would cover almost the whole date range. The min/max values would overlap, the filter could no longer skip any group, and DuckDB would read almost the entire file.
+
+Q: Compare the execution time of the CSV and Parquet queries. Which part is network, which is parsing?
+
+A: CSV, 2 columns: 28.2 MiB read, 1 GET, 1.27 s. Parquet, 2 columns: 203.5 KiB read, 4 GETs, 0.34 s. Parquet with the date filter: 16.0 KiB read, 1 GET, 0.12 s. The total time mixes download and parsing. The network depends on the volume transferred; parsing depends on the CPU, since the CSV must be split and converted row by row while Parquet is already typed and binary. To separate the two, run the CSV query twice in the same session with the cache enabled: the second run does not download the file again.
+
+
+6. SQL exercises
+----------------
+Exercise 1: average orders per user and average quantity per order
+    SELECT count(*) * 1.0 / count(DISTINCT user_uuid) AS avg_orders_per_user, avg(quantity) AS avg_quantity_per_order FROM orders;
+
+Exercise 2: first and last order per user, and days between them
+    SELECT user_uuid, min(date) AS first_order, max(date) AS last_order, date_diff('day', min(date), max(date)) AS days_between FROM orders GROUP BY user_uuid ORDER BY user_uuid;
+
+Exercise 3: hour of the day with the highest quantity sold
+    SELECT hour(date) AS hour_of_day, sum(quantity) AS quantity FROM orders GROUP BY hour_of_day ORDER BY quantity DESC LIMIT 1;
+
+Exercise 4: month-over-month variation in percent, per product
+    WITH monthly AS (SELECT product, date_trunc('month', date) AS month, sum(quantity) AS quantity FROM orders GROUP BY product, month)
+    SELECT product, month, quantity, round(100 * (quantity - lag(quantity) OVER w) / lag(quantity) OVER w, 1) AS variation_pct
+    FROM monthly WINDOW w AS (PARTITION BY product ORDER BY month) ORDER BY product, month;
+
+Exercise 5: users who ordered every product at least once
+    SELECT u.uuid, u.username FROM orders o JOIN users u ON o.user_uuid = u.uuid GROUP BY u.uuid, u.username HAVING count(DISTINCT o.product) = (SELECT count(DISTINCT product) FROM orders);
+
+
+7. Python script orders_report.py
+---------------------------------
+- The $product parameter is passed to DuckDB, not concatenated: this protects against SQL injection.
+- fetchall() returns a list of tuples, one per month.
+- Expected output without filter: four rows. With -p cookie: 128/376, 121/371, 122/340, 95/278.
